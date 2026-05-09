@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-folder-sort-by-created",
-	"version": "1.0.0",
+	"version": "0.1.0",
 	"description": "Sort folders in Obsidian File Explorer by OS creation date",
 	"main": "main.js",
 	"scripts": {
