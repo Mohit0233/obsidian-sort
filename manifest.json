@@ -1,7 +1,7 @@
 {
 	"id": "folder-sort-by-created",
 	"name": "Folder Sort by Created Date",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"minAppVersion": "1.5.7",
 	"description": "Sort folders in File Explorer by their OS-level creation date (ctime).",
 	"author": "Mohit",

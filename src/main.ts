@@ -14,15 +14,15 @@ interface FolderSortSettings {
 }
 
 const DEFAULT_SETTINGS: FolderSortSettings = {
-	sortOrder: "newest-first",
+	sortOrder: "oldest-first",
 	enabled: true,
 };
 
 export default class FolderSortPlugin extends Plugin {
 	settings: FolderSortSettings = DEFAULT_SETTINGS;
-	private folderCtimeCache: Map<string, number> = new Map();
-	private originalSortFunction: any = null;
-	private patched = false;
+	folderCtimeCache: Map<string, number> = new Map();
+	private originalGetSortedFolderItems: any = null;
+	patched = false;
 
 	async onload() {
 		await this.loadSettings();
@@ -40,18 +40,16 @@ export default class FolderSortPlugin extends Plugin {
 			this.refreshSort();
 		});
 
-		// Wait for layout to be ready before patching
 		this.app.workspace.onLayoutReady(() => {
 			this.cacheAllFolderCtimes().then(() => {
 				this.patchFileExplorer();
 			});
 		});
 
-		// Re-cache when folders are created/deleted/renamed
 		this.registerEvent(
 			this.app.vault.on("create", (file) => {
 				if (file instanceof TFolder) {
-					this.cacheFolderCtime(file.path);
+					this.cacheFolderCtime(file.path).then(() => this.triggerSort());
 				}
 			})
 		);
@@ -59,6 +57,7 @@ export default class FolderSortPlugin extends Plugin {
 			this.app.vault.on("delete", (file) => {
 				if (file instanceof TFolder) {
 					this.folderCtimeCache.delete(file.path);
+					this.triggerSort();
 				}
 			})
 		);
@@ -66,7 +65,7 @@ export default class FolderSortPlugin extends Plugin {
 			this.app.vault.on("rename", (file, oldPath) => {
 				if (file instanceof TFolder) {
 					this.folderCtimeCache.delete(oldPath);
-					this.cacheFolderCtime(file.path);
+					this.cacheFolderCtime(file.path).then(() => this.triggerSort());
 				}
 			})
 		);
@@ -84,9 +83,6 @@ export default class FolderSortPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	/**
-	 * Fetch ctime for a single folder from the OS filesystem
-	 */
 	async cacheFolderCtime(path: string) {
 		try {
 			const stat = await this.app.vault.adapter.stat(path);
@@ -98,18 +94,11 @@ export default class FolderSortPlugin extends Plugin {
 		}
 	}
 
-	/**
-	 * Walk through all folders in the vault and cache their ctime
-	 */
 	async cacheAllFolderCtimes() {
 		const allFolders = this.app.vault.getAllFolders(false);
-		const promises = allFolders.map((folder) => this.cacheFolderCtime(folder.path));
-		await Promise.all(promises);
+		await Promise.all(allFolders.map((folder) => this.cacheFolderCtime(folder.path)));
 	}
 
-	/**
-	 * Find the File Explorer leaf and its internal view
-	 */
 	private getFileExplorerView(): any | null {
 		const leaves = this.app.workspace.getLeavesOfType("file-explorer");
 		if (leaves.length === 0) return null;
@@ -117,139 +106,79 @@ export default class FolderSortPlugin extends Plugin {
 	}
 
 	/**
-	 * Monkey-patch the File Explorer's sort function to sort folders by ctime
+	 * Override getSortedFolderItems to sort folders by OS ctime.
+	 *
+	 * Obsidian's default getSortedFolderItems sorts folders alphabetically
+	 * regardless of sort order. We intercept this to re-sort the folder
+	 * portion of the returned array by cached ctime.
 	 */
 	private patchFileExplorer() {
 		const fileExplorer = this.getFileExplorerView();
-		if (!fileExplorer) return;
-
-		// The file explorer has a `sortOrder` or uses `sort()` internally.
-		// We need to intercept how children are sorted within each folder.
-		// The internal API uses `fileExplorer.sort()` or the fileItems have a sort.
-		// We'll monkey-patch the `sort` method on the file explorer.
+		if (!fileExplorer || this.patched) return;
 
 		const plugin = this;
+		this.originalGetSortedFolderItems = fileExplorer.getSortedFolderItems.bind(fileExplorer);
 
-		// Access the internal sort function
-		// In Obsidian's file explorer, sorting happens via the `sort` method on the view
-		if (fileExplorer.sort && !this.patched) {
-			this.originalSortFunction = fileExplorer.sort.bind(fileExplorer);
+		fileExplorer.getSortedFolderItems = function (folder: any) {
+			// Call original to get the default sorted list
+			const items: any[] = plugin.originalGetSortedFolderItems(folder);
 
-			fileExplorer.sort = function (this: any) {
-				// Call original sort first (sorts files normally)
-				plugin.originalSortFunction.call(this);
+			if (!plugin.settings.enabled) return items;
 
-				if (!plugin.settings.enabled) return;
+			// Separate folders and files while preserving relative order:
+			// Obsidian puts all folders first, then files.
+			const folderItems: any[] = [];
+			const fileItems: any[] = [];
+			let lastFolderIdx = -1;
 
-				// Now re-sort folders by ctime within each folder item
-				plugin.sortFolderChildren(fileExplorer);
-			};
+			for (let i = 0; i < items.length; i++) {
+				if (items[i].file instanceof TFolder) {
+					folderItems.push(items[i]);
+					lastFolderIdx = i;
+				} else {
+					fileItems.push(items[i]);
+				}
+			}
 
-			this.patched = true;
+			if (folderItems.length < 2) return items;
 
-			// Trigger an initial sort
-			this.refreshSort();
-		} else {
-			// Fallback: directly sort the folder items
-			this.sortFolderChildren(fileExplorer);
-		}
+			const multiplier = plugin.settings.sortOrder === "newest-first" ? -1 : 1;
+
+			folderItems.sort((a, b) => {
+				const ctimeA = plugin.folderCtimeCache.get(a.file.path) ?? 0;
+				const ctimeB = plugin.folderCtimeCache.get(b.file.path) ?? 0;
+				return (ctimeA - ctimeB) * multiplier;
+			});
+
+			// Reconstruct: sorted folders first, then files in original order
+			return [...folderItems, ...fileItems];
+		};
+
+		this.patched = true;
+		this.triggerSort();
 	}
 
 	private unpatchFileExplorer() {
-		if (this.originalSortFunction && this.patched) {
+		if (this.originalGetSortedFolderItems && this.patched) {
 			const fileExplorer = this.getFileExplorerView();
 			if (fileExplorer) {
-				fileExplorer.sort = this.originalSortFunction;
+				fileExplorer.getSortedFolderItems = this.originalGetSortedFolderItems;
+				this.triggerSort();
 			}
 			this.patched = false;
 		}
 	}
 
-	/**
-	 * Core sorting logic: reorder folder DOM elements by ctime
-	 */
-	private sortFolderChildren(fileExplorer: any) {
-		if (!this.settings.enabled) return;
-
-		// fileExplorer.fileItems is a Record<string, FileItem>
-		// Each FileItem has .file (TAbstractFile) and .el (HTMLElement)
-		const fileItems = fileExplorer?.fileItems;
-		if (!fileItems) return;
-
-		// Group items by their parent folder
-		const parentGroups = new Map<string, Array<{ path: string; item: any }>>();
-
-		for (const [path, item] of Object.entries(fileItems) as [string, any][]) {
-			const file = item.file;
-			if (!(file instanceof TFolder)) continue;
-
-			const parentPath = file.parent ? file.parent.path : "/";
-			if (!parentGroups.has(parentPath)) {
-				parentGroups.set(parentPath, []);
-			}
-			parentGroups.get(parentPath)!.push({ path, item });
-		}
-
-		// For each parent, sort its folder children by ctime and reorder DOM
-		for (const [_parentPath, folderItems] of parentGroups) {
-			if (folderItems.length < 2) continue;
-
-			const multiplier = this.settings.sortOrder === "newest-first" ? -1 : 1;
-
-			folderItems.sort((a, b) => {
-				const ctimeA = this.folderCtimeCache.get(a.path) ?? 0;
-				const ctimeB = this.folderCtimeCache.get(b.path) ?? 0;
-				return (ctimeA - ctimeB) * multiplier;
-			});
-
-			// Reorder the DOM elements
-			// Each item.el is a child inside the parent's children container
-			const firstEl = folderItems[0].item.el;
-			if (!firstEl) continue;
-			const container = firstEl.parentElement;
-			if (!container) continue;
-
-			// Collect all non-folder elements to preserve their positions
-			// We only reorder folder elements among themselves
-			const allChildren = Array.from(container.children) as HTMLElement[];
-			const folderEls = new Set(folderItems.map((fi) => fi.item.el));
-
-			// Find positions where folders currently are
-			const folderPositions: number[] = [];
-			allChildren.forEach((child, idx) => {
-				if (folderEls.has(child)) {
-					folderPositions.push(idx);
-				}
-			});
-
-			// Place sorted folders into those positions
-			const newChildren = [...allChildren];
-			folderItems.forEach((fi, i) => {
-				if (i < folderPositions.length) {
-					newChildren[folderPositions[i]] = fi.item.el;
-				}
-			});
-
-			// Re-append in new order
-			for (const child of newChildren) {
-				container.appendChild(child);
-			}
+	private triggerSort() {
+		const fileExplorer = this.getFileExplorerView();
+		if (fileExplorer?.sort) {
+			fileExplorer.sort();
 		}
 	}
 
-	/**
-	 * Refresh sort - re-cache and re-sort
-	 */
 	async refreshSort() {
 		await this.cacheAllFolderCtimes();
-		const fileExplorer = this.getFileExplorerView();
-		if (fileExplorer) {
-			if (this.patched && fileExplorer.sort) {
-				fileExplorer.sort();
-			} else {
-				this.sortFolderChildren(fileExplorer);
-			}
-		}
+		this.triggerSort();
 	}
 }
 
